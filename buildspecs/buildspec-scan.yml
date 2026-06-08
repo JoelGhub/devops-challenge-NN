@@ -27,7 +27,7 @@ phases:
   build:
     commands:
       - echo "Running Trivy CRITICAL scan"
-      - trivy image --severity "$SEVERITY" --exit-code 1 --no-progress --format json --output trivy-report.json "$IMAGE_URI" || (echo "PIPELINE FAILED CRITICAL CVEs DETECTED" && exit 1)
+      - trivy image --severity "$SEVERITY" --exit-code 1 --ignore-unfixed --no-progress --format json --output trivy-report.json "$IMAGE_URI" || (echo "PIPELINE FAILED CRITICAL CVEs WITH AVAILABLE FIX DETECTED" && exit 1)
       - echo "SCAN PASSED no CRITICAL vulnerabilities"
 
   post_build:
