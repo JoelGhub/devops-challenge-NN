@@ -1,87 +1,39 @@
 version: 0.2
-# =============================================================
-# Stage: SECURITY SCAN (Trivy)
-# - Pulls the build-<hash> image from ECR
-# - Scans for CRITICAL CVEs only
-# - exit-code 1  →  pipeline fails if ANY critical found
-# - Produces trivy-report.json as audit artifact
-#
-# Primary source : SourceOutput  ($CODEBUILD_SRC_DIR)
-# Secondary input: BuildOutput   ($CODEBUILD_SRC_DIR_BuildOutput)
-# =============================================================
 
 env:
   variables:
     TRIVY_VERSION: "0.50.4"
     SEVERITY: "CRITICAL"
+    AWS_DEFAULT_REGION: "eu-west-3"
   parameter-store:
     ECR_REGISTRY: "/devops/ecr/registry"
 
 phases:
   install:
     commands:
-      - echo "=== Installing Trivy $TRIVY_VERSION ==="
-      - |
-        curl -sSfL \
-          "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
-          | tar -xz -C /usr/local/bin trivy
+      - echo "Installing Trivy $TRIVY_VERSION"
+      - curl -sSfL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" | tar -xz -C /usr/local/bin trivy
       - trivy --version
-      # Docker needed to pull ECR image for scanning
       - nohup /usr/local/bin/dockerd --host=unix:///var/run/docker.sock &
-      - timeout 15 sh -c "until docker info; do echo 'Waiting for Docker...'; sleep 1; done"
+      - timeout 15 sh -c "until docker info; do echo waiting; sleep 1; done"
 
   pre_build:
     commands:
-      - echo "=== Reading image info from BuildOutput artifact ==="
-      - cp "$CODEBUILD_SRC_DIR_BuildOutput/image-info.json" ./image-info.json
-      - cat image-info.json
-      - IMAGE_URI=$(python3 -c "import json; d=json.load(open('image-info.json')); print(d['imageUri'])")
-      - echo "Scanning -> $IMAGE_URI"
-      - |
-        aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
-          | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+      - cat "$CODEBUILD_SRC_DIR_BuildOutput/image-info.json"
+      - IMAGE_URI=$(python3 -c "import json; print(json.load(open('$CODEBUILD_SRC_DIR_BuildOutput/image-info.json'))['imageUri'])")
+      - echo "Scanning $IMAGE_URI"
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
   build:
     commands:
-      - echo "=== Running Trivy: CRITICAL vulnerabilities only ==="
-      - |
-        trivy image \
-          --severity "$SEVERITY" \
-          --exit-code 1 \
-          --no-progress \
-          --format json \
-          --output trivy-report.json \
-          "$IMAGE_URI" \
-        || (echo ""; \
-            echo "##############################################"; \
-            echo "# PIPELINE FAILED: CRITICAL CVEs detected!  #"; \
-            echo "# Fix vulnerabilities and re-push.          #"; \
-            echo "##############################################"; \
-            exit 1)
-      - echo "=== SCAN PASSED: No CRITICAL vulnerabilities found ==="
+      - echo "Running Trivy CRITICAL scan"
+      - trivy image --severity "$SEVERITY" --exit-code 1 --no-progress --format json --output trivy-report.json "$IMAGE_URI" || (echo "PIPELINE FAILED CRITICAL CVEs DETECTED" && exit 1)
+      - echo "SCAN PASSED no CRITICAL vulnerabilities"
 
   post_build:
     commands:
-      - echo "=== Scan summary ==="
-      - |
-        python3 - <<'PYEOF'
-        import json, sys
-        try:
-          data = json.load(open('trivy-report.json'))
-          results = data.get('Results', [])
-          total = sum(len(r.get('Vulnerabilities') or []) for r in results)
-          print(f"Critical vulnerabilities found: {total}")
-          for r in results:
-            vulns = r.get('Vulnerabilities') or []
-            if vulns:
-              print(f"  Target: {r['Target']}")
-              for v in vulns:
-                print(f"    - {v['VulnerabilityID']} | {v.get('Title','N/A')[:60]}")
-        except Exception as e:
-          print(f"Could not parse report: {e}")
-        PYEOF
-      # Pass image-info forward
-      - cp image-info.json image-info-scanned.json
+      - cp "$CODEBUILD_SRC_DIR_BuildOutput/image-info.json" image-info-scanned.json
+      - echo "Scan complete"
 
 artifacts:
   files:
