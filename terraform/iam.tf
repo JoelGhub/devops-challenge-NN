@@ -48,6 +48,11 @@ resource "aws_iam_role_policy" "codepipeline" {
         Effect   = "Allow"
         Action   = ["kms:GenerateDataKey", "kms:Decrypt"]
         Resource = aws_kms_key.artifacts.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["sns:Publish"]
+        Resource = aws_sns_topic.approvals.arn
       }
     ]
   })

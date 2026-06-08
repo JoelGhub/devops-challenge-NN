@@ -11,8 +11,8 @@ env:
 phases:
   install:
     commands:
-      - echo "Installing Trivy $TRIVY_VERSION"
-      - curl -sSfL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" | tar -xz -C /usr/local/bin trivy
+      - echo "Installing Trivy (latest)"
+      - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
       - trivy --version
       - nohup /usr/local/bin/dockerd --host=unix:///var/run/docker.sock &
       - timeout 15 sh -c "until docker info; do echo waiting; sleep 1; done"

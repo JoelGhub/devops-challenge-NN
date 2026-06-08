@@ -1,96 +1,33 @@
 version: 0.2
-# =============================================================
-# Stage: DEPLOY – DEV
-# - Verifies cosign signature against KMS key (BEFORE deploy)
-# - Deploys to dev EKS cluster using Helm
-# - Uses image digest reference to guarantee exact signed image
-#
-# Primary source : SourceOutput  ($CODEBUILD_SRC_DIR)   ← Helm charts here
-# Secondary input: SignedOutput  ($CODEBUILD_SRC_DIR_SignedOutput)
-#
-# ENV VARS set in CodeBuild project (CodePipeline CloudFormation):
-#   ENVIRONMENT=dev | EKS_CLUSTER_NAME | NAMESPACE | HELM_RELEASE_NAME
-# =============================================================
 
 env:
-  parameter-store:
-    KMS_KEY_ARN: "/devops/cosign/kms-key-arn"
-    ECR_REGISTRY: "/devops/ecr/registry"
+  variables:
+    ENVIRONMENT: "dev"
+    NAMESPACE: "springboot-dev"
+    HELM_RELEASE: "springboot-app-dev"
+    EKS_CLUSTER: "springboot-cluster-dev"
+    AWS_DEFAULT_REGION: "eu-west-3"
 
 phases:
-  install:
-    commands:
-      - echo "=== Installing tools (kubectl, Helm, cosign) ==="
-      - bash "$CODEBUILD_SRC_DIR/scripts/install-tools.sh"
-
   pre_build:
     commands:
-      - echo "=== Reading signed image info ==="
-      - cp "$CODEBUILD_SRC_DIR_SignedOutput/signed-image-info.json" ./signed-image-info.json
-      - cat signed-image-info.json
-
-      - IMAGE_REF=$(python3 -c "import json; print(json.load(open('signed-image-info.json'))['imageRef'])")
-      - IMAGE_URI=$(python3 -c "import json; print(json.load(open('signed-image-info.json'))['imageUri'])")
-      - IMAGE_TAG=$(python3 -c "import json; print(json.load(open('signed-image-info.json'))['imageTag'])")
-      - IMAGE_DIGEST=$(python3 -c "import json; print(json.load(open('signed-image-info.json'))['imageDigest'])")
-      - IMAGE_REPO=$(echo "$IMAGE_URI" | cut -d: -f1)
-
-      - echo "=== [SECURITY] Verifying cosign signature before deploy ==="
-      - |
-        aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
-          | docker login --username AWS --password-stdin "$ECR_REGISTRY" 2>/dev/null || true
-      - |
-        cosign verify \
-          --key "awskms:///${KMS_KEY_ARN}" \
-          --insecure-ignore-tlog=true \
-          "$IMAGE_REF" \
-        || (echo ""; \
-            echo "###################################################"; \
-            echo "# DEPLOYMENT BLOCKED: Signature verification FAILED"; \
-            echo "# Image has not been signed by the CI pipeline.   "; \
-            echo "###################################################"; \
-            exit 1)
-      - echo "=== Signature verified – proceeding with deployment ==="
-
-      - echo "=== Configuring kubectl for EKS cluster: $EKS_CLUSTER_NAME ==="
-      - aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_DEFAULT_REGION"
-      - kubectl cluster-info
-      - kubectl get nodes
+      - cat "$CODEBUILD_SRC_DIR_SignedOutput/signed-image-info.json"
+      - IMAGE_REF=$(python3 -c "import json; print(json.load(open('$CODEBUILD_SRC_DIR_SignedOutput/signed-image-info.json'))['imageRef'])")
+      - IMAGE_TAG=$(python3 -c "import json; print(json.load(open('$CODEBUILD_SRC_DIR_SignedOutput/signed-image-info.json'))['imageTag'])")
+      - IMAGE_DIGEST=$(python3 -c "import json; print(json.load(open('$CODEBUILD_SRC_DIR_SignedOutput/signed-image-info.json'))['imageDigest'])")
+      - echo "=== DEPLOY SIMULATION - $ENVIRONMENT ==="
+      - echo "Image $IMAGE_REF"
 
   build:
     commands:
-      - echo "=== Creating namespace [$NAMESPACE] ==="
-      - kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
-
-      - echo "=== Deploying to $ENVIRONMENT with Helm ==="
-      - |
-        helm upgrade --install "$HELM_RELEASE_NAME" \
-          "$CODEBUILD_SRC_DIR/helm/springboot-app" \
-          --namespace "$NAMESPACE" \
-          --values "$CODEBUILD_SRC_DIR/helm/springboot-app/values.yaml" \
-          --values "$CODEBUILD_SRC_DIR/helm/springboot-app/values-${ENVIRONMENT}.yaml" \
-          --set image.repository="$IMAGE_REPO" \
-          --set image.tag="$IMAGE_TAG" \
-          --set image.digest="$IMAGE_DIGEST" \
-          --set environment="$ENVIRONMENT" \
-          --set podAnnotations."cosign\\.sigstore\\.dev/signed"="true" \
-          --set podAnnotations."cosign\\.sigstore\\.dev/imageDigest"="$IMAGE_DIGEST" \
-          --atomic \
-          --cleanup-on-fail \
-          --timeout 5m \
-          --wait
+      - echo "[SIMULATED] aws eks update-kubeconfig --name $EKS_CLUSTER --region $AWS_DEFAULT_REGION"
+      - echo "[SIMULATED] kubectl create namespace $NAMESPACE"
+      - echo "[SIMULATED] cosign verify --key awskms:///... $IMAGE_REF"
+      - echo "[SIMULATED] helm upgrade --install $HELM_RELEASE helm/springboot-app --namespace $NAMESPACE --set image.digest=$IMAGE_DIGEST --atomic --wait"
+      - echo "[SIMULATED] kubectl get pods -n $NAMESPACE"
+      - echo "Deploy simulation to $ENVIRONMENT completed successfully"
 
   post_build:
     commands:
-      - echo "=== Deployment to $ENVIRONMENT completed successfully ==="
-      - echo "--- Pods ---"
-      - kubectl get pods -n "$NAMESPACE" -o wide
-      - echo "--- Services ---"
-      - kubectl get services -n "$NAMESPACE"
-      - echo "--- Helm Release Status ---"
-      - helm status "$HELM_RELEASE_NAME" -n "$NAMESPACE"
-
-artifacts:
-  files:
-    - signed-image-info.json
-  name: DeployDevOutput
+      - echo "=== $ENVIRONMENT deployment simulation DONE ==="
+      - echo "Would have deployed $IMAGE_TAG to EKS cluster $EKS_CLUSTER namespace $NAMESPACE"

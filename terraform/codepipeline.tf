@@ -12,7 +12,7 @@ resource "aws_codepipeline" "main" {
     }
   }
 
-  # ── Stage 1: Source ──────────────────────────────────────────────────────────
+  # ── 1. Source ────────────────────────────────────────────────
   stage {
     name = "Source"
     action {
@@ -22,16 +22,15 @@ resource "aws_codepipeline" "main" {
       provider         = "CodeCommit"
       version          = "1"
       output_artifacts = ["SourceOutput"]
-
       configuration = {
         RepositoryName       = aws_codecommit_repository.app.repository_name
         BranchName           = var.branch_name
-        PollForSourceChanges = "false"  # EventBridge rule handles the trigger
+        PollForSourceChanges = "false"
       }
     }
   }
 
-  # ── Stage 2: Build — Maven + Docker + ECR push ───────────────────────────────
+  # ── 2. Build ─────────────────────────────────────────────────
   stage {
     name = "Build"
     action {
@@ -42,16 +41,13 @@ resource "aws_codepipeline" "main" {
       version          = "1"
       input_artifacts  = ["SourceOutput"]
       output_artifacts = ["BuildOutput"]
-
       configuration = {
         ProjectName = aws_codebuild_project.ci["build"].name
       }
     }
   }
 
-  # ── Stage 3: Scan — Trivy CRITICAL gate ──────────────────────────────────────
-  # SourceOutput is primary ($CODEBUILD_SRC_DIR); BuildOutput is secondary
-  # ($CODEBUILD_SRC_DIR_BuildOutput) — required by buildspec-scan.yml
+  # ── 3. Scan (Trivy) ───────────────────────────────────────────
   stage {
     name = "Scan"
     action {
@@ -62,17 +58,14 @@ resource "aws_codepipeline" "main" {
       version          = "1"
       input_artifacts  = ["SourceOutput", "BuildOutput"]
       output_artifacts = ["ScanOutput"]
-
       configuration = {
-        ProjectName          = aws_codebuild_project.ci["scan"].name
-        PrimarySource        = "SourceOutput"
+        ProjectName   = aws_codebuild_project.ci["scan"].name
+        PrimarySource = "SourceOutput"
       }
     }
   }
 
-  # ── Stage 4: Sign — cosign + KMS key → ECR OCI signature artifact ────────────
-  # SourceOutput is primary; ScanOutput is secondary
-  # ($CODEBUILD_SRC_DIR_ScanOutput) — required by buildspec-sign-push.yml
+  # ── 4. Sign (cosign + KMS) ────────────────────────────────────
   stage {
     name = "Sign"
     action {
@@ -83,9 +76,91 @@ resource "aws_codepipeline" "main" {
       version          = "1"
       input_artifacts  = ["SourceOutput", "ScanOutput"]
       output_artifacts = ["SignedOutput"]
-
       configuration = {
         ProjectName   = aws_codebuild_project.ci["sign-push"].name
+        PrimarySource = "SourceOutput"
+      }
+    }
+  }
+
+  # ── 5. Deploy Dev (simulated) ─────────────────────────────────
+  stage {
+    name = "DeployDev"
+    action {
+      name            = "DeployDev"
+      category        = "Build"
+      owner           = "AWS"
+      provider        = "CodeBuild"
+      version         = "1"
+      input_artifacts = ["SourceOutput", "SignedOutput"]
+      configuration = {
+        ProjectName   = aws_codebuild_project.deploy["deploy-dev"].name
+        PrimarySource = "SourceOutput"
+      }
+    }
+  }
+
+  # ── 6. Approval: Dev → Staging ────────────────────────────────
+  stage {
+    name = "ApproveStaging"
+    action {
+      name     = "ApproveStaging"
+      category = "Approval"
+      owner    = "AWS"
+      provider = "Manual"
+      version  = "1"
+      configuration = {
+        NotificationArn = aws_sns_topic.approvals.arn
+        CustomData      = "Dev OK? Approve to promote to Staging."
+      }
+    }
+  }
+
+  # ── 7. Deploy Staging (simulated) ────────────────────────────
+  stage {
+    name = "DeployStaging"
+    action {
+      name            = "DeployStaging"
+      category        = "Build"
+      owner           = "AWS"
+      provider        = "CodeBuild"
+      version         = "1"
+      input_artifacts = ["SourceOutput", "SignedOutput"]
+      configuration = {
+        ProjectName   = aws_codebuild_project.deploy["deploy-staging"].name
+        PrimarySource = "SourceOutput"
+      }
+    }
+  }
+
+  # ── 8. Approval: Staging → Prod ───────────────────────────────
+  stage {
+    name = "ApproveProd"
+    action {
+      name     = "ApproveProd"
+      category = "Approval"
+      owner    = "AWS"
+      provider = "Manual"
+      version  = "1"
+      configuration = {
+        NotificationArn = aws_sns_topic.approvals.arn
+        CustomData      = "Staging OK? Approve to promote to Production."
+      }
+    }
+  }
+
+  # ── 9. Deploy Prod (simulated) ────────────────────────────────
+  stage {
+    name = "DeployProd"
+    action {
+      name            = "DeployProd"
+      category        = "Build"
+      owner           = "AWS"
+      provider        = "CodeBuild"
+      version         = "1"
+      input_artifacts = ["SourceOutput", "SignedOutput"]
+      configuration = {
+        ProjectName   = aws_codebuild_project.deploy["deploy-prod"].name
         PrimarySource = "SourceOutput"
       }
     }
