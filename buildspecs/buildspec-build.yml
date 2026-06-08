@@ -1,0 +1,81 @@
+version: 0.2
+# =============================================================
+# Stage: BUILD
+# - Compiles Spring Boot app with Maven
+# - Builds Docker image (multi-stage)
+# - Pushes to ECR with tag  build-<commit-hash>
+# - Produces image-info.json for downstream stages
+# =============================================================
+
+env:
+  variables:
+    AWS_DEFAULT_REGION: "eu-west-3"
+  parameter-store:
+    ECR_REPO_URI:  "/devops/ecr/repo-uri"
+    ECR_REGISTRY:  "/devops/ecr/registry"
+
+phases:
+  install:
+    runtime-versions:
+      java: corretto17
+    commands:
+      - echo "=== Installing Docker CLI ==="
+      - nohup /usr/local/bin/dockerd --host=unix:///var/run/docker.sock &
+      - timeout 15 sh -c "until docker info; do echo 'Waiting for Docker...'; sleep 1; done"
+
+  pre_build:
+    commands:
+      - echo "=== Pre-build: tagging and ECR login ==="
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - BUILD_TAG="build-${COMMIT_HASH}"
+      - IMAGE_URI="${ECR_REPO_URI}:${BUILD_TAG}"
+      - echo "Image will be pushed as -> $IMAGE_URI"
+      - |
+        aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
+          | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+      - |
+        aws ecr describe-repositories \
+          --repository-names "$(basename $ECR_REPO_URI)" \
+          --region "$AWS_DEFAULT_REGION" > /dev/null 2>&1 \
+          || aws ecr create-repository \
+               --repository-name "$(basename $ECR_REPO_URI)" \
+               --region "$AWS_DEFAULT_REGION" \
+               --image-scanning-configuration scanOnPush=false
+
+  build:
+    commands:
+      - echo "=== Building Spring Boot application (Maven) ==="
+      - mvn clean package -DskipTests -B --no-transfer-progress
+      - echo "=== Building Docker image ==="
+      - docker build --pull --no-cache -t "$IMAGE_URI" .
+      - echo "=== Pushing image to ECR ==="
+      - docker push "$IMAGE_URI"
+
+  post_build:
+    commands:
+      - echo "=== Capturing image digest ==="
+      - |
+        IMAGE_DIGEST=$(aws ecr describe-images \
+          --repository-name "$(basename $ECR_REPO_URI)" \
+          --image-ids imageTag="$BUILD_TAG" \
+          --region "$AWS_DEFAULT_REGION" \
+          --query 'imageDetails[0].imageDigest' \
+          --output text)
+      - echo "Digest -> $IMAGE_DIGEST"
+      - |
+        cat > image-info.json <<EOF
+        {
+          "imageUri":    "$IMAGE_URI",
+          "imageTag":    "$BUILD_TAG",
+          "imageDigest": "$IMAGE_DIGEST",
+          "commitHash":  "$COMMIT_HASH",
+          "buildId":     "$CODEBUILD_BUILD_ID"
+        }
+        EOF
+      - echo "=== image-info.json ==="
+      - cat image-info.json
+
+artifacts:
+  files:
+    - image-info.json
+  name: BuildOutput

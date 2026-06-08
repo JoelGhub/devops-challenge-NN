@@ -1,0 +1,108 @@
+# =============================================================
+# values.yaml – Default values (base)
+# Override per environment with values-dev/staging/prod.yaml
+# =============================================================
+
+replicaCount: 1
+
+image:
+  repository: ""        # Set by pipeline: <account>.dkr.ecr.<region>.amazonaws.com/springboot-app
+  tag: "latest"         # Set by pipeline: <commit-hash>
+  digest: ""            # Set by pipeline: sha256:<digest>  – used for secure image reference
+  pullPolicy: Always    # Always pull to enforce digest pinning
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Spring Boot active profile (maps to SPRING_PROFILES_ACTIVE env var)
+environment: "default"
+
+serviceAccount:
+  create: true
+  automount: false       # Disable auto-mount unless required by app
+  annotations: {}
+  name: ""
+
+# Pod-level annotations (extended by pipeline with cosign metadata)
+podAnnotations:
+  cosign.sigstore.dev/signed: "false"    # Overridden to "true" by pipeline
+
+podLabels: {}
+
+# Pod security context
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 2000
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container security context
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  runAsNonRoot: true
+  runAsUser: 1000
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: false
+  className: "nginx"
+  annotations: {}
+  hosts:
+    - host: springboot-app.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources:
+  requests:
+    cpu: "250m"
+    memory: "256Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+
+# Spring Boot Actuator health endpoints
+livenessProbe:
+  httpGet:
+    path: /actuator/health/liveness
+    port: 8080
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  failureThreshold: 3
+  timeoutSeconds: 5
+
+readinessProbe:
+  httpGet:
+    path: /actuator/health/readiness
+    port: 8080
+  initialDelaySeconds: 20
+  periodSeconds: 5
+  failureThreshold: 3
+  timeoutSeconds: 3
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Extra environment variables passed to the container
+extraEnv: []
+#  - name: MY_VAR
+#    value: "my-value"

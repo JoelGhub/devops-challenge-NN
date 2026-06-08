@@ -1,0 +1,52 @@
+# ── Terraform ────────────────────────────────────────────────
+**/.terraform/
+**/.terraform.lock.hcl
+**/terraform.tfstate
+**/terraform.tfstate.backup
+**/terraform.tfvars
+**/*.auto.tfvars
+**/override.tf
+**/override.tf.json
+
+# ── Maven / Java ─────────────────────────────────────────────
+target/
+*.class
+*.jar
+*.war
+*.ear
+.mvn/wrapper/maven-wrapper.jar
+
+# ── Pipeline artifacts (generados por CodeBuild en local) ─────
+image-info.json
+image-info-scanned.json
+signed-image-info.json
+trivy-report.json
+.image-info.json
+cosign-linux-amd64
+
+# ── AWS / Secretos ────────────────────────────────────────────
+.aws/
+*.pem
+*.key
+credentials
+.env
+.env.*
+
+# ── macOS ─────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+__MACOSX/
+
+# ── IDEs ──────────────────────────────────────────────────────
+.idea/
+*.iml
+.vscode/
+*.swp
+*~
+
+# ── Logs ─────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Claude Code ───────────────────────────────────────────────
+.claude/

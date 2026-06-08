@@ -1,0 +1,32 @@
+---
+# =============================================================
+# Kubernetes Namespaces – one per environment
+# Apply manually once per cluster (pre-requisite):
+#   kubectl apply -f k8s/namespace.yaml
+# =============================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: springboot-dev
+  labels:
+    app.kubernetes.io/name: springboot-app
+    environment: dev
+    managed-by: kubectl
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: springboot-staging
+  labels:
+    app.kubernetes.io/name: springboot-app
+    environment: staging
+    managed-by: kubectl
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: springboot-prod
+  labels:
+    app.kubernetes.io/name: springboot-app
+    environment: prod
+    managed-by: kubectl

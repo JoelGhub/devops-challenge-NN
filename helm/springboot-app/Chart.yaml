@@ -1,0 +1,15 @@
+apiVersion: v2
+name: springboot-app
+description: Helm chart for a Spring Boot microservice with cosign-verified image deployment
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+maintainers:
+  - name: DevOps Team
+    email: devops@company.com
+keywords:
+  - springboot
+  - java
+  - microservice
+  - eks
+home: https://github.com/your-org/springboot-app

@@ -1,0 +1,109 @@
+version: 0.2
+# =============================================================
+# Stage: SIGN & PUSH (cosign + AWS KMS)
+# - Re-tags image from build-<hash> → <hash>  (release tag)
+# - Signs with cosign using an asymmetric KMS key (ECC_NIST_P256)
+# - Signature stored in ECR as OCI artifact (sha256-<digest>.sig)
+# - Immediately verifies own signature before proceeding
+# - Produces signed-image-info.json for deploy stages
+#
+# Primary source : SourceOutput  ($CODEBUILD_SRC_DIR)
+# Secondary input: ScanOutput    ($CODEBUILD_SRC_DIR_ScanOutput)
+# =============================================================
+
+env:
+  variables:
+    AWS_DEFAULT_REGION: "eu-west-3"
+  parameter-store:
+    ECR_REPO_URI:      "/devops/ecr/repo-uri"
+    ECR_REGISTRY:      "/devops/ecr/registry"
+    KMS_KEY_ARN:       "/devops/cosign/kms-key-arn"
+    KMS_KEY_ALIAS:     "/devops/cosign/kms-key-alias"
+
+phases:
+  install:
+    commands:
+      - echo "=== Installing cosign $COSIGN_VERSION ==="
+      - |
+        curl -sSfLO \
+          "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+      - install -m 0755 cosign-linux-amd64 /usr/local/bin/cosign
+      - cosign version
+      # Docker for re-tagging
+      - nohup /usr/local/bin/dockerd --host=unix:///var/run/docker.sock &
+      - timeout 15 sh -c "until docker info; do echo 'Waiting for Docker...'; sleep 1; done"
+
+  pre_build:
+    commands:
+      - echo "=== Reading image info from ScanOutput artifact ==="
+      - cp "$CODEBUILD_SRC_DIR_ScanOutput/image-info-scanned.json" ./image-info.json
+      - cat image-info.json
+      - BUILD_TAG=$(python3 -c "import json; print(json.load(open('image-info.json'))['imageTag'])")
+      - COMMIT_HASH=$(python3 -c "import json; print(json.load(open('image-info.json'))['commitHash'])")
+      - BUILD_URI="${ECR_REPO_URI}:${BUILD_TAG}"
+      - RELEASE_TAG="${COMMIT_HASH}"
+      - RELEASE_URI="${ECR_REPO_URI}:${RELEASE_TAG}"
+      - echo "Build image  -> $BUILD_URI"
+      - echo "Release image -> $RELEASE_URI"
+      - |
+        aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
+          | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+  build:
+    commands:
+      - echo "=== Pulling build image ==="
+      - docker pull "$BUILD_URI"
+
+      - echo "=== Re-tagging as release ==="
+      - docker tag "$BUILD_URI" "$RELEASE_URI"
+      - docker push "$RELEASE_URI"
+
+      - echo "=== Getting release image digest ==="
+      - |
+        IMAGE_DIGEST=$(aws ecr describe-images \
+          --repository-name "$(basename $ECR_REPO_URI)" \
+          --image-ids imageTag="$RELEASE_TAG" \
+          --region "$AWS_DEFAULT_REGION" \
+          --query 'imageDetails[0].imageDigest' \
+          --output text)
+      - IMAGE_WITH_DIGEST="${ECR_REPO_URI}@${IMAGE_DIGEST}"
+      - echo "Digest reference -> $IMAGE_WITH_DIGEST"
+
+      - echo "=== Signing image with cosign (KMS key) ==="
+      - |
+        cosign sign \
+          --key "awskms:///${KMS_KEY_ARN}" \
+          --tlog-upload=false \
+          "$IMAGE_WITH_DIGEST"
+      - echo "=== Image signed successfully ==="
+
+  post_build:
+    commands:
+      - echo "=== Verifying own signature (self-check) ==="
+      - |
+        cosign verify \
+          --key "awskms:///${KMS_KEY_ARN}" \
+          --insecure-ignore-tlog=true \
+          "$IMAGE_WITH_DIGEST" \
+        || (echo "SELF-VERIFICATION FAILED – aborting!"; exit 1)
+      - echo "=== Signature self-check passed ==="
+
+      - |
+        cat > signed-image-info.json <<EOF
+        {
+          "imageUri":    "$RELEASE_URI",
+          "imageTag":    "$RELEASE_TAG",
+          "imageDigest": "$IMAGE_DIGEST",
+          "imageRef":    "$IMAGE_WITH_DIGEST",
+          "kmsKeyArn":   "$KMS_KEY_ARN",
+          "signed":      true,
+          "buildId":     "$CODEBUILD_BUILD_ID"
+        }
+        EOF
+      - echo "=== signed-image-info.json ==="
+      - cat signed-image-info.json
+
+artifacts:
+  files:
+    - signed-image-info.json
+  name: SignedOutput

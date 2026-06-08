@@ -1,0 +1,50 @@
+# =============================================================
+# values-prod.yaml – Production overrides
+# =============================================================
+replicaCount: 3
+
+environment: "prod"
+
+resources:
+  requests:
+    cpu: "1000m"
+    memory: "1Gi"
+  limits:
+    cpu: "2000m"
+    memory: "2Gi"
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 60
+
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+  hosts:
+    - host: springboot-app.company.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: springboot-app-tls
+      hosts:
+        - springboot-app.company.com
+
+# Spread pods across AZs for HA
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - springboot-app
+          topologyKey: topology.kubernetes.io/zone

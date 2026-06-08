@@ -1,0 +1,133 @@
+version: 0.2
+# =============================================================
+# Stage: DEPLOY – PRODUCTION
+# Stricter than dev/staging:
+#   1. Cosign signature verified (mandatory)
+#   2. Verifies image digest in ECR matches signed digest
+#   3. Helm deploy with --atomic (auto-rollback on failure)
+#   4. Post-deploy smoke test (readiness check)
+#   5. Audit trail written to SSM Parameter Store
+#   6. SNS notification on success/failure
+#
+# ENV VARS set in CodeBuild project:
+#   ENVIRONMENT=prod | EKS_CLUSTER_NAME | NAMESPACE | HELM_RELEASE_NAME
+# =============================================================
+
+env:
+  parameter-store:
+    KMS_KEY_ARN:      "/devops/cosign/kms-key-arn"
+    ECR_REGISTRY:     "/devops/ecr/registry"
+    ECR_REPO_URI:     "/devops/ecr/repo-uri"
+    APPROVAL_TOPIC:   "/devops/sns/approval-topic-arn"
+
+phases:
+  install:
+    commands:
+      - bash "$CODEBUILD_SRC_DIR/scripts/install-tools.sh"
+
+  pre_build:
+    commands:
+      - cp "$CODEBUILD_SRC_DIR_SignedOutput/signed-image-info.json" ./signed-image-info.json
+      - cat signed-image-info.json
+
+      - IMAGE_REF=$(python3    -c "import json; print(json.load(open('signed-image-info.json'))['imageRef'])")
+      - IMAGE_URI=$(python3    -c "import json; print(json.load(open('signed-image-info.json'))['imageUri'])")
+      - IMAGE_TAG=$(python3    -c "import json; print(json.load(open('signed-image-info.json'))['imageTag'])")
+      - IMAGE_DIGEST=$(python3 -c "import json; print(json.load(open('signed-image-info.json'))['imageDigest'])")
+      - IMAGE_REPO=$(echo "$IMAGE_URI" | cut -d: -f1)
+
+      # ── Verify 1: cosign signature ────────────────────────
+      - echo "=== [SECURITY] Step 1/2 – Verifying cosign signature ==="
+      - |
+        aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
+          | docker login --username AWS --password-stdin "$ECR_REGISTRY" 2>/dev/null || true
+      - |
+        cosign verify \
+          --key "awskms:///${KMS_KEY_ARN}" \
+          --insecure-ignore-tlog=true \
+          "$IMAGE_REF" \
+        || (echo "PRODUCTION DEPLOYMENT BLOCKED: Signature verification FAILED"; exit 1)
+      - echo "Cosign signature OK"
+
+      # ── Verify 2: ECR digest matches signed digest ────────
+      - echo "=== [SECURITY] Step 2/2 – Cross-checking ECR digest ==="
+      - |
+        LIVE_DIGEST=$(aws ecr describe-images \
+          --repository-name "$(basename $ECR_REPO_URI)" \
+          --image-ids imageTag="$IMAGE_TAG" \
+          --region "$AWS_DEFAULT_REGION" \
+          --query 'imageDetails[0].imageDigest' \
+          --output text)
+      - |
+        if [ "$LIVE_DIGEST" != "$IMAGE_DIGEST" ]; then
+          echo "DIGEST MISMATCH! ECR=$LIVE_DIGEST vs Signed=$IMAGE_DIGEST"
+          exit 1
+        fi
+      - echo "Digest cross-check OK: $IMAGE_DIGEST"
+
+      - aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_DEFAULT_REGION"
+      - kubectl cluster-info
+
+  build:
+    commands:
+      - kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+      - echo "=== Deploying to PRODUCTION with Helm ==="
+      - |
+        helm upgrade --install "$HELM_RELEASE_NAME" \
+          "$CODEBUILD_SRC_DIR/helm/springboot-app" \
+          --namespace "$NAMESPACE" \
+          --values "$CODEBUILD_SRC_DIR/helm/springboot-app/values.yaml" \
+          --values "$CODEBUILD_SRC_DIR/helm/springboot-app/values-${ENVIRONMENT}.yaml" \
+          --set image.repository="$IMAGE_REPO" \
+          --set image.tag="$IMAGE_TAG" \
+          --set image.digest="$IMAGE_DIGEST" \
+          --set environment="$ENVIRONMENT" \
+          --set podAnnotations."cosign\\.sigstore\\.dev/signed"="true" \
+          --set podAnnotations."cosign\\.sigstore\\.dev/imageDigest"="$IMAGE_DIGEST" \
+          --atomic \
+          --cleanup-on-fail \
+          --timeout 10m \
+          --wait \
+          --history-max 5
+
+  post_build:
+    on-failure: ABORT
+    commands:
+      - echo "=== Post-deploy: smoke test (readiness check) ==="
+      - |
+        kubectl rollout status deployment/"$HELM_RELEASE_NAME" \
+          -n "$NAMESPACE" --timeout=5m \
+        || (echo "Rollout not ready – Helm atomic should have rolled back"; exit 1)
+
+      - echo "=== Production deployment completed successfully ==="
+      - kubectl get pods     -n "$NAMESPACE" -o wide
+      - kubectl get services -n "$NAMESPACE"
+      - helm status "$HELM_RELEASE_NAME" -n "$NAMESPACE"
+
+      # Audit trail
+      - DEPLOY_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+      - |
+        for PARAM in \
+          "/devops/deployments/${ENVIRONMENT}/last-image-digest=$IMAGE_DIGEST" \
+          "/devops/deployments/${ENVIRONMENT}/last-image-tag=$IMAGE_TAG" \
+          "/devops/deployments/${ENVIRONMENT}/last-deploy-time=$DEPLOY_TIME" \
+          "/devops/deployments/${ENVIRONMENT}/last-build-id=$CODEBUILD_BUILD_ID"; do
+            KEY="${PARAM%%=*}"
+            VAL="${PARAM#*=}"
+            aws ssm put-parameter --name "$KEY" --value "$VAL" \
+              --type String --overwrite --region "$AWS_DEFAULT_REGION" || true
+        done
+
+      # Success notification
+      - |
+        aws sns publish \
+          --topic-arn "$APPROVAL_TOPIC" \
+          --subject "✅ Production deployment succeeded – $IMAGE_TAG" \
+          --message "Image $IMAGE_URI (digest: $IMAGE_DIGEST) deployed to production at $DEPLOY_TIME. Build: $CODEBUILD_BUILD_ID" \
+          --region "$AWS_DEFAULT_REGION" || true
+
+artifacts:
+  files:
+    - signed-image-info.json
+  name: DeployProdOutput

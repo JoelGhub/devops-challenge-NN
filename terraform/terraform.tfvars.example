@@ -1,0 +1,11 @@
+# Copy this file to terraform.tfvars and fill in your values
+# cp terraform.tfvars.example terraform.tfvars
+
+project_name         = "devops-challenge"
+aws_region           = "us-east-1"
+codecommit_repo_name = "springboot-app"
+branch_name          = "main"
+
+# Optional: set your email to receive SNS notifications for pipeline events.
+# Leave empty ("") to approve manually from the AWS Console.
+approval_email = ""

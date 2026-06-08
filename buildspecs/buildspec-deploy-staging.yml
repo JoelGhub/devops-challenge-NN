@@ -1,0 +1,95 @@
+version: 0.2
+# =============================================================
+# Stage: DEPLOY – STAGING
+# Identical verification flow to dev; targets staging EKS cluster.
+# Extra: records deployment audit trail in SSM Parameter Store.
+#
+# ENV VARS set in CodeBuild project:
+#   ENVIRONMENT=staging | EKS_CLUSTER_NAME | NAMESPACE | HELM_RELEASE_NAME
+# =============================================================
+
+env:
+  parameter-store:
+    KMS_KEY_ARN:  "/devops/cosign/kms-key-arn"
+    ECR_REGISTRY: "/devops/ecr/registry"
+
+phases:
+  install:
+    commands:
+      - bash "$CODEBUILD_SRC_DIR/scripts/install-tools.sh"
+
+  pre_build:
+    commands:
+      - cp "$CODEBUILD_SRC_DIR_SignedOutput/signed-image-info.json" ./signed-image-info.json
+      - cat signed-image-info.json
+
+      - IMAGE_REF=$(python3    -c "import json; print(json.load(open('signed-image-info.json'))['imageRef'])")
+      - IMAGE_URI=$(python3    -c "import json; print(json.load(open('signed-image-info.json'))['imageUri'])")
+      - IMAGE_TAG=$(python3    -c "import json; print(json.load(open('signed-image-info.json'))['imageTag'])")
+      - IMAGE_DIGEST=$(python3 -c "import json; print(json.load(open('signed-image-info.json'))['imageDigest'])")
+      - IMAGE_REPO=$(echo "$IMAGE_URI" | cut -d: -f1)
+
+      - echo "=== [SECURITY] Verifying cosign signature before staging deploy ==="
+      - |
+        aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
+          | docker login --username AWS --password-stdin "$ECR_REGISTRY" 2>/dev/null || true
+      - |
+        cosign verify \
+          --key "awskms:///${KMS_KEY_ARN}" \
+          --insecure-ignore-tlog=true \
+          "$IMAGE_REF" \
+        || (echo "DEPLOYMENT BLOCKED: Signature verification FAILED"; exit 1)
+      - echo "=== Signature verified – proceeding ==="
+
+      - aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_DEFAULT_REGION"
+      - kubectl cluster-info
+
+  build:
+    commands:
+      - kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+      - |
+        helm upgrade --install "$HELM_RELEASE_NAME" \
+          "$CODEBUILD_SRC_DIR/helm/springboot-app" \
+          --namespace "$NAMESPACE" \
+          --values "$CODEBUILD_SRC_DIR/helm/springboot-app/values.yaml" \
+          --values "$CODEBUILD_SRC_DIR/helm/springboot-app/values-${ENVIRONMENT}.yaml" \
+          --set image.repository="$IMAGE_REPO" \
+          --set image.tag="$IMAGE_TAG" \
+          --set image.digest="$IMAGE_DIGEST" \
+          --set environment="$ENVIRONMENT" \
+          --set podAnnotations."cosign\\.sigstore\\.dev/signed"="true" \
+          --set podAnnotations."cosign\\.sigstore\\.dev/imageDigest"="$IMAGE_DIGEST" \
+          --atomic \
+          --cleanup-on-fail \
+          --timeout 5m \
+          --wait
+
+  post_build:
+    commands:
+      - echo "=== Staging deployment completed ==="
+      - kubectl get pods     -n "$NAMESPACE" -o wide
+      - kubectl get services -n "$NAMESPACE"
+      - helm status "$HELM_RELEASE_NAME" -n "$NAMESPACE"
+
+      # Audit trail in SSM
+      - DEPLOY_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+      - |
+        aws ssm put-parameter \
+          --name "/devops/deployments/${ENVIRONMENT}/last-image-digest" \
+          --value "$IMAGE_DIGEST" \
+          --type String \
+          --overwrite \
+          --region "$AWS_DEFAULT_REGION" || true
+      - |
+        aws ssm put-parameter \
+          --name "/devops/deployments/${ENVIRONMENT}/last-deploy-time" \
+          --value "$DEPLOY_TIME" \
+          --type String \
+          --overwrite \
+          --region "$AWS_DEFAULT_REGION" || true
+
+artifacts:
+  files:
+    - signed-image-info.json
+  name: DeployStagingOutput

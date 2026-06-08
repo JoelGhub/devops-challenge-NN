@@ -1,0 +1,950 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Secure, Auditable CI/CD Pipeline for Spring Boot on EKS.
+  Stages: Source → Build → Trivy Scan → Cosign Sign → Deploy Dev
+         → Approval → Deploy Staging → Approval → Deploy Prod
+
+# =============================================================
+# PARAMETERS
+# =============================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: springboot-app
+    Description: Project name (used as prefix for all resources)
+
+  CodeCommitRepoName:
+    Type: String
+    Default: springboot-app
+    Description: AWS CodeCommit repository name (source)
+
+  BranchName:
+    Type: String
+    Default: main
+    Description: Git branch that triggers the pipeline
+
+  EksClusterDev:
+    Type: String
+    Default: springboot-cluster-dev
+    Description: EKS cluster name for development
+
+  EksClusterStaging:
+    Type: String
+    Default: springboot-cluster-staging
+    Description: EKS cluster name for staging
+
+  EksClusterProd:
+    Type: String
+    Default: springboot-cluster-prod
+    Description: EKS cluster name for production
+
+  ApprovalEmail:
+    Type: String
+    Description: Email address to receive deployment approval notifications
+
+  CosignVersion:
+    Type: String
+    Default: v2.2.4
+    Description: Cosign version to install in CodeBuild
+
+  HelmVersion:
+    Type: String
+    Default: 3.14.0
+    Description: Helm version to install in CodeBuild
+
+# =============================================================
+# RESOURCES
+# =============================================================
+Resources:
+
+  # -----------------------------------------------------------
+  # ECR Repository
+  # -----------------------------------------------------------
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref ProjectName
+      ImageScanningConfiguration:
+        ScanOnPush: false          # We use Trivy manually for full control
+      ImageTagMutability: MUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Expire build-tagged images after 7 days",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["build-"],
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 7
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Keep only last 30 release images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["latest"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 30
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # -----------------------------------------------------------
+  # KMS Key for Cosign (Asymmetric - ECC_NIST_P256)
+  # -----------------------------------------------------------
+  CosignKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'Asymmetric KMS key for cosign image signing - ${ProjectName}'
+      KeySpec: ECC_NIST_P256
+      KeyUsage: SIGN_VERIFY
+      MultiRegion: false
+      EnableKeyRotation: false      # Not supported for asymmetric keys
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRootAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowCodeBuildSign
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt CodeBuildRole.Arn
+            Action:
+              - kms:Sign
+              - kms:Verify
+              - kms:GetPublicKey
+              - kms:DescribeKey
+            Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  CosignKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-cosign'
+      TargetKeyId: !Ref CosignKMSKey
+
+  # -----------------------------------------------------------
+  # S3 Artifact Bucket (encrypted, versioned)
+  # -----------------------------------------------------------
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ProjectName}-pipeline-artifacts-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub '${ArtifactBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  # -----------------------------------------------------------
+  # SSM Parameter Store (configuration for all CodeBuild jobs)
+  # -----------------------------------------------------------
+  SSMEcrRepoUri:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /devops/ecr/repo-uri
+      Type: String
+      Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}'
+
+  SSMEcrRegistry:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /devops/ecr/registry
+      Type: String
+      Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com'
+
+  SSMKmsKeyArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /devops/cosign/kms-key-arn
+      Type: String
+      Value: !GetAtt CosignKMSKey.Arn
+
+  SSMKmsKeyAlias:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /devops/cosign/kms-key-alias
+      Type: String
+      Value: !Sub 'alias/${ProjectName}-cosign'
+
+  # -----------------------------------------------------------
+  # SNS Topic for Manual Approval notifications
+  # -----------------------------------------------------------
+  ApprovalTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-deployment-approvals'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref ApprovalEmail
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # -----------------------------------------------------------
+  # CloudWatch Log Groups for CodeBuild
+  # -----------------------------------------------------------
+  LogGroupBuild:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/codebuild/${ProjectName}-build'
+      RetentionInDays: 30
+
+  LogGroupScan:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/codebuild/${ProjectName}-scan'
+      RetentionInDays: 30
+
+  LogGroupSign:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/codebuild/${ProjectName}-sign-push'
+      RetentionInDays: 30
+
+  LogGroupDeployDev:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/codebuild/${ProjectName}-deploy-dev'
+      RetentionInDays: 30
+
+  LogGroupDeployStaging:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/codebuild/${ProjectName}-deploy-staging'
+      RetentionInDays: 30
+
+  LogGroupDeployProd:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/codebuild/${ProjectName}-deploy-prod'
+      RetentionInDays: 90
+
+  # -----------------------------------------------------------
+  # IAM Role for CodeBuild (shared across all projects)
+  # -----------------------------------------------------------
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-codebuild-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+      Policies:
+        - PolicyName: CodeBuildBasePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CloudWatch Logs
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/codebuild/${ProjectName}*'
+
+              # S3 Artifacts
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub '${ArtifactBucket.Arn}/*'
+
+              # SSM Parameters
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameters
+                  - ssm:GetParameter
+                  - ssm:GetParametersByPath
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/devops/*'
+
+              # EKS – needed by kubectl/helm for cluster access
+              - Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                  - eks:ListClusters
+                Resource: '*'
+
+              # KMS – cosign sign/verify
+              - Effect: Allow
+                Action:
+                  - kms:Sign
+                  - kms:Verify
+                  - kms:GetPublicKey
+                  - kms:DescribeKey
+                Resource: !GetAtt CosignKMSKey.Arn
+
+              # ECR – full ECR access for push/pull/sign
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeRepositories
+                  - ecr:CreateRepository
+                  - ecr:TagResource
+                Resource: '*'
+
+              # CodeCommit – read source (used by CodePipeline, but CodeBuild may also need it)
+              - Effect: Allow
+                Action:
+                  - codecommit:GitPull
+                Resource: !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${CodeCommitRepoName}'
+
+              # SNS – post-deploy notifications
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref ApprovalTopic
+
+  # -----------------------------------------------------------
+  # IAM Role for CodePipeline
+  # -----------------------------------------------------------
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-codepipeline-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: CodePipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CodeCommit
+              - Effect: Allow
+                Action:
+                  - codecommit:CancelUploadArchive
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:UploadArchive
+                Resource: !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${CodeCommitRepoName}'
+
+              # S3 Artifacts
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub '${ArtifactBucket.Arn}/*'
+
+              # CodeBuild – start builds
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                  - codebuild:StopBuild
+                Resource: '*'
+
+              # SNS – manual approvals
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref ApprovalTopic
+
+  # -----------------------------------------------------------
+  # EventBridge Rule – trigger pipeline on CodeCommit push
+  # -----------------------------------------------------------
+  PipelineTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-pipeline-trigger-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: StartPipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${ProjectName}-secure-pipeline'
+
+  PipelineTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-trigger-on-commit'
+      Description: Trigger pipeline on CodeCommit push to main branch
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - CodeCommit Repository State Change
+        resources:
+          - !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${CodeCommitRepoName}'
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - !Ref BranchName
+      Targets:
+        - Arn: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${ProjectName}-secure-pipeline'
+          Id: TriggerPipeline
+          RoleArn: !GetAtt PipelineTriggerRole.Arn
+
+  # -----------------------------------------------------------
+  # CodeBuild Project: Build
+  # Compiles the Spring Boot app with Maven and builds + pushes
+  # the Docker image to ECR with tag build-<commit-hash>
+  # -----------------------------------------------------------
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-build'
+      Description: Build Spring Boot app and push Docker image to ECR
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true          # Required for Docker daemon
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: APP_NAME
+            Value: !Ref ProjectName
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspecs/buildspec-build.yml
+      TimeoutInMinutes: 20
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub '/codebuild/${ProjectName}-build'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: build
+
+  # -----------------------------------------------------------
+  # CodeBuild Project: Security Scan (Trivy)
+  # Scans the ECR image for CRITICAL CVEs. Fails the pipeline
+  # if any critical vulnerability is found.
+  # -----------------------------------------------------------
+  ScanProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-scan'
+      Description: Trivy CRITICAL vulnerability scan – fails on any finding
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspecs/buildspec-scan.yml
+      TimeoutInMinutes: 15
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub '/codebuild/${ProjectName}-scan'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: scan
+
+  # -----------------------------------------------------------
+  # CodeBuild Project: Sign & Push (cosign + KMS)
+  # Re-tags image as release, signs with cosign using KMS key,
+  # and stores the signature in ECR as OCI artifact.
+  # -----------------------------------------------------------
+  SignPushProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-sign-push'
+      Description: Tag release, sign with cosign/KMS, store signature in ECR
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: COSIGN_VERSION
+            Value: !Ref CosignVersion
+          - Name: APP_NAME
+            Value: !Ref ProjectName
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspecs/buildspec-sign-push.yml
+      TimeoutInMinutes: 10
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub '/codebuild/${ProjectName}-sign-push'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: sign
+
+  # -----------------------------------------------------------
+  # CodeBuild Project: Deploy Dev
+  # -----------------------------------------------------------
+  DeployDevProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-deploy-dev'
+      Description: Verify cosign signature and deploy to dev EKS with Helm
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: ENVIRONMENT
+            Value: dev
+          - Name: EKS_CLUSTER_NAME
+            Value: !Ref EksClusterDev
+          - Name: NAMESPACE
+            Value: springboot-dev
+          - Name: HELM_RELEASE_NAME
+            Value: !Sub '${ProjectName}-dev'
+          - Name: COSIGN_VERSION
+            Value: !Ref CosignVersion
+          - Name: HELM_VERSION
+            Value: !Ref HelmVersion
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspecs/buildspec-deploy-dev.yml
+      TimeoutInMinutes: 20
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub '/codebuild/${ProjectName}-deploy-dev'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: deploy-dev
+
+  # -----------------------------------------------------------
+  # CodeBuild Project: Deploy Staging
+  # -----------------------------------------------------------
+  DeployStagingProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-deploy-staging'
+      Description: Verify cosign signature and deploy to staging EKS with Helm
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: ENVIRONMENT
+            Value: staging
+          - Name: EKS_CLUSTER_NAME
+            Value: !Ref EksClusterStaging
+          - Name: NAMESPACE
+            Value: springboot-staging
+          - Name: HELM_RELEASE_NAME
+            Value: !Sub '${ProjectName}-staging'
+          - Name: COSIGN_VERSION
+            Value: !Ref CosignVersion
+          - Name: HELM_VERSION
+            Value: !Ref HelmVersion
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspecs/buildspec-deploy-staging.yml
+      TimeoutInMinutes: 20
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub '/codebuild/${ProjectName}-deploy-staging'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: deploy-staging
+
+  # -----------------------------------------------------------
+  # CodeBuild Project: Deploy Prod
+  # -----------------------------------------------------------
+  DeployProdProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-deploy-prod'
+      Description: Verify cosign signature and deploy to production EKS with Helm
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE    # Larger for prod reliability
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: ENVIRONMENT
+            Value: prod
+          - Name: EKS_CLUSTER_NAME
+            Value: !Ref EksClusterProd
+          - Name: NAMESPACE
+            Value: springboot-prod
+          - Name: HELM_RELEASE_NAME
+            Value: !Sub '${ProjectName}-prod'
+          - Name: COSIGN_VERSION
+            Value: !Ref CosignVersion
+          - Name: HELM_VERSION
+            Value: !Ref HelmVersion
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspecs/buildspec-deploy-prod.yml
+      TimeoutInMinutes: 30
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub '/codebuild/${ProjectName}-deploy-prod'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: deploy-prod
+
+  # -----------------------------------------------------------
+  # CodePipeline – Main Pipeline
+  # Stages:
+  #  1. Source        → CodeCommit
+  #  2. Build         → Maven + Docker + ECR push (build-<hash>)
+  #  3. SecurityScan  → Trivy CRITICAL (fail = stop)
+  #  4. SignAndPush   → cosign KMS sign → ECR signature OCI artifact
+  #  5. DeployDev     → cosign verify + Helm deploy to dev EKS
+  #  6. ApproveStaging → SNS email approval
+  #  7. DeployStaging → cosign verify + Helm deploy to staging EKS
+  #  8. ApproveProd   → SNS email approval
+  #  9. DeployProd    → cosign verify + Helm deploy to prod EKS
+  # -----------------------------------------------------------
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${ProjectName}-secure-pipeline'
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      RestartExecutionOnUpdate: false
+      Stages:
+
+        # ── Stage 1: Source ──────────────────────────────────
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              Configuration:
+                RepositoryName: !Ref CodeCommitRepoName
+                BranchName: !Ref BranchName
+                PollForSourceChanges: false   # EventBridge rule handles trigger
+              OutputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+
+        # ── Stage 2: Build ───────────────────────────────────
+        - Name: Build
+          Actions:
+            - Name: BuildDockerImage
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref BuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+
+        # ── Stage 3: Security Scan (Trivy) ───────────────────
+        - Name: SecurityScan
+          Actions:
+            - Name: TrivyCriticalScan
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref ScanProject
+                PrimarySource: SourceOutput
+              InputArtifacts:
+                - Name: SourceOutput
+                - Name: BuildOutput
+              OutputArtifacts:
+                - Name: ScanOutput
+              RunOrder: 1
+
+        # ── Stage 4: Sign & Push (cosign + KMS) ──────────────
+        - Name: SignAndPush
+          Actions:
+            - Name: CosignSign
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref SignPushProject
+                PrimarySource: SourceOutput
+              InputArtifacts:
+                - Name: SourceOutput
+                - Name: ScanOutput
+              OutputArtifacts:
+                - Name: SignedOutput
+              RunOrder: 1
+
+        # ── Stage 5: Deploy to Dev ───────────────────────────
+        - Name: DeployDev
+          Actions:
+            - Name: HelmDeployDev
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref DeployDevProject
+                PrimarySource: SourceOutput
+              InputArtifacts:
+                - Name: SourceOutput
+                - Name: SignedOutput
+              OutputArtifacts:
+                - Name: DeployDevOutput
+              RunOrder: 1
+
+        # ── Stage 6: Approve Staging ─────────────────────────
+        - Name: ApproveStaging
+          Actions:
+            - Name: ManualApproval
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                NotificationArn: !Ref ApprovalTopic
+                CustomData: >
+                  Dev deployment succeeded. Review logs and approve to promote
+                  to STAGING. Check CloudWatch for deployment health.
+                ExternalEntityLink: !Sub >
+                  https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${ProjectName}-secure-pipeline
+              RunOrder: 1
+
+        # ── Stage 7: Deploy to Staging ───────────────────────
+        - Name: DeployStaging
+          Actions:
+            - Name: HelmDeployStaging
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref DeployStagingProject
+                PrimarySource: SourceOutput
+              InputArtifacts:
+                - Name: SourceOutput
+                - Name: SignedOutput
+              OutputArtifacts:
+                - Name: DeployStagingOutput
+              RunOrder: 1
+
+        # ── Stage 8: Approve Production ──────────────────────
+        - Name: ApproveProd
+          Actions:
+            - Name: ManualApproval
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                NotificationArn: !Ref ApprovalTopic
+                CustomData: >
+                  Staging deployment succeeded. Review staging environment and
+                  approve to promote to PRODUCTION. This action is irreversible
+                  until rollback is triggered.
+                ExternalEntityLink: !Sub >
+                  https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${ProjectName}-secure-pipeline
+              RunOrder: 1
+
+        # ── Stage 9: Deploy to Production ────────────────────
+        - Name: DeployProd
+          Actions:
+            - Name: HelmDeployProd
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref DeployProdProject
+                PrimarySource: SourceOutput
+              InputArtifacts:
+                - Name: SourceOutput
+                - Name: SignedOutput
+              OutputArtifacts:
+                - Name: DeployProdOutput
+              RunOrder: 1
+
+# =============================================================
+# OUTPUTS
+# =============================================================
+Outputs:
+  PipelineUrl:
+    Description: AWS CodePipeline console URL
+    Value: !Sub 'https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${ProjectName}-secure-pipeline'
+    Export:
+      Name: !Sub '${ProjectName}-PipelineUrl'
+
+  ECRRepositoryUri:
+    Description: ECR repository URI for the Spring Boot image
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}'
+    Export:
+      Name: !Sub '${ProjectName}-ECRUri'
+
+  CosignKMSKeyArn:
+    Description: KMS Key ARN used by cosign for image signing/verification
+    Value: !GetAtt CosignKMSKey.Arn
+    Export:
+      Name: !Sub '${ProjectName}-CosignKMSKeyArn'
+
+  CosignKMSKeyAlias:
+    Description: KMS Key alias for cosign
+    Value: !Sub 'alias/${ProjectName}-cosign'
+
+  ArtifactBucketName:
+    Description: S3 bucket used for pipeline artifacts
+    Value: !Ref ArtifactBucket
+    Export:
+      Name: !Sub '${ProjectName}-ArtifactBucket'
+
+  ApprovalTopicArn:
+    Description: SNS topic ARN for deployment approval notifications
+    Value: !Ref ApprovalTopic
+    Export:
+      Name: !Sub '${ProjectName}-ApprovalTopic'
+
+  CodeBuildRoleArn:
+    Description: >
+      CodeBuild IAM Role ARN. Add this to each EKS cluster aws-auth ConfigMap
+      to allow kubectl/helm deployments.
+    Value: !GetAtt CodeBuildRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-CodeBuildRoleArn'
