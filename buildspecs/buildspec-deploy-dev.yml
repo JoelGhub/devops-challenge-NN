@@ -15,6 +15,7 @@ phases:
       - IMAGE_REF=$(python3 -c "import json; print(json.load(open('$CODEBUILD_SRC_DIR_SignedOutput/signed-image-info.json'))['imageRef'])")
       - IMAGE_TAG=$(python3 -c "import json; print(json.load(open('$CODEBUILD_SRC_DIR_SignedOutput/signed-image-info.json'))['imageTag'])")
       - IMAGE_DIGEST=$(python3 -c "import json; print(json.load(open('$CODEBUILD_SRC_DIR_SignedOutput/signed-image-info.json'))['imageDigest'])")
+      - IMAGE_REPO=$(python3 -c "import json; d=json.load(open('$CODEBUILD_SRC_DIR_SignedOutput/signed-image-info.json')); print(d['imageUri'].rsplit(':', 1)[0])")
       - echo "=== DEPLOY SIMULATION - $ENVIRONMENT ==="
       - echo "Image $IMAGE_REF"
 
@@ -23,7 +24,7 @@ phases:
       - echo "[SIMULATED] aws eks update-kubeconfig --name $EKS_CLUSTER --region $AWS_DEFAULT_REGION"
       - echo "[SIMULATED] kubectl create namespace $NAMESPACE"
       - echo "[SIMULATED] cosign verify --key awskms:///... $IMAGE_REF"
-      - echo "[SIMULATED] helm upgrade --install $HELM_RELEASE helm/springboot-app --namespace $NAMESPACE --set image.digest=$IMAGE_DIGEST --atomic --wait"
+      - echo "[SIMULATED] helm upgrade --install $HELM_RELEASE helm/springboot-app --namespace $NAMESPACE --set image.repository=$IMAGE_REPO --set image.digest=$IMAGE_DIGEST --atomic --wait"
       - echo "[SIMULATED] kubectl get pods -n $NAMESPACE"
       - echo "Deploy simulation to $ENVIRONMENT completed successfully"
 
